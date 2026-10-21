@@ -1,7 +1,8 @@
 //! Read an archive, then build the index used to pull its members.
 //!
 //! [`reader::ArchiveReader`] takes mapped ar bytes and finds members and symbols.
-//! [`index::index_archive`] turns them into an [`index::ArchiveState`] for
+//! [`thin::map_members`] maps the object files a thin archive points to.
+//! [`index::index_archive`] turns both into an [`index::ArchiveState`] for
 //! [`crate::symbols::extract_archive_members`]. The archive is an ar file;
 //! only its object members are ELF files.
 //!
@@ -10,3 +11,4 @@
 
 pub(crate) mod index;
 pub(crate) mod reader;
+pub(crate) mod thin;

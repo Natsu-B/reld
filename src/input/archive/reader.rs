@@ -9,6 +9,12 @@
 //! records may lack Rust's native alignment. We follow GNU ar's name and index
 //! formats and also accept BSD inline names.
 //!
+//! A thin archive starts with `!<thin>` instead of `!<arch>`. It keeps its armap
+//! and name table, but each object member is only a header: the name is a path
+//! to the object file, and the bytes stay in that file. Build systems use thin
+//! archives to avoid copying every object. The header's size field still holds
+//! the file's size, so we must not skip that many bytes to find the next header.
+//!
 //! References: [GNU ar](https://sourceware.org/binutils/docs/binutils/ar.html);
 //! ELF gABI "ELF Header" applies to the bytes from [`ArchiveMember::object_bytes`].
 
@@ -20,24 +26,29 @@ use anyhow::{Context, Result, bail, ensure};
 #[derive(Debug)]
 pub(crate) struct ArchiveReader<'a> {
     data: &'a [u8],
+    /// Object members name other files instead of holding bytes.
+    thin: bool,
     long_name_table: OnceCell<Option<MemberSlice>>,
 }
 
 impl<'a> ArchiveReader<'a> {
-    /// Check the magic. Thin archives refer to other files, so reject them here.
+    /// Check the magic, which also tells a thin archive from a regular one.
     pub(crate) fn new(data: &'a [u8]) -> Result<Self> {
-        if data.starts_with(THIN_MAGIC) {
-            bail!("thin archives are unsupported");
-        }
+        let thin = is_thin_archive(data);
         ensure!(
-            check_magic(data),
+            thin || data.starts_with(AR_MAGIC),
             "invalid archive format: missing magic header"
         );
 
         Ok(Self {
             data,
+            thin,
             long_name_table: OnceCell::new(),
         })
+    }
+
+    pub(crate) fn is_thin(&self) -> bool {
+        self.thin
     }
 
     /// Visit members in file order, including the armap and long-name table.
@@ -144,8 +155,8 @@ struct MemberSlice {
     size: usize,
 }
 
-pub(crate) fn check_magic(data: &[u8]) -> bool {
-    data.starts_with(AR_MAGIC)
+pub(crate) fn is_thin_archive(data: &[u8]) -> bool {
+    data.starts_with(THIN_MAGIC)
 }
 
 /// A symbol name and the archive byte offset of its member header.
@@ -160,6 +171,8 @@ pub(crate) struct ArchiveSymbol<'a> {
 pub(crate) struct ArchiveMember<'a> {
     data: &'a [u8],
     offset: usize,
+    /// Copied from the reader: a thin object member has no data here.
+    thin: bool,
 }
 
 impl<'a> ArchiveMember<'a> {
@@ -176,11 +189,12 @@ impl<'a> ArchiveMember<'a> {
         self.offset + size_of::<ArchiveMemberHeader>()
     }
 
-    /// Borrow the whole member data after checking its bounds; this may include a filename.
-    pub(crate) fn payload(&self) -> Result<&'a [u8]> {
+    /// Borrow the member data stored here after checking its bounds; this may
+    /// include a filename. A thin object member stores none.
+    fn payload(&self) -> Result<&'a [u8]> {
         let start = self.payload_offset();
         let end = start
-            .checked_add(self.size()?)
+            .checked_add(self.stored_size()?)
             .context("member payload end overflowed usize")?;
 
         self.data
@@ -190,7 +204,7 @@ impl<'a> ArchiveMember<'a> {
 
     /// Round past odd-sized data: ar puts the next header on an even byte boundary.
     pub(crate) fn next_offset(&self) -> Result<usize> {
-        let size = self.size()?;
+        let size = self.stored_size()?;
         let payload_end = self
             .payload_offset()
             .checked_add(size)
@@ -213,15 +227,32 @@ impl<'a> ArchiveMember<'a> {
             "/SYM64/" => Ok(MemberName::SymbolTable64),
             "//" => Ok(MemberName::LongNameTable),
             _ => {
-                if let Some(offset) = raw_name.strip_prefix('/') {
+                if let Some(rest) = raw_name.strip_prefix('/') {
+                    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                    let (offset, tail) = rest.split_at(digits);
+                    // GNU ar writes `/offset:header` when a thin archive lists a
+                    // member of a regular archive instead of an object file.
                     ensure!(
-                        !offset.is_empty() && offset.bytes().all(|byte| byte.is_ascii_digit()),
+                        !(self.thin && tail.starts_with(':')),
+                        "thin archive member {raw_name:?} is inside a nested archive, which is unsupported"
+                    );
+                    // GNU ar first writes the short name with its `/` ending, then
+                    // writes the offset over bytes 1 to 14 only. A name of exactly
+                    // 15 bytes thus leaves its `/` in the last byte, as in
+                    // `/348           /`. Like BFD, read the digits and skip it.
+                    ensure!(
+                        !offset.is_empty() && tail.bytes().all(|byte| byte == b' ' || byte == b'/'),
                         "invalid long-name reference: {raw_name:?}"
                     );
                     return Ok(MemberName::LongNameOffset(offset.parse()?));
                 }
 
                 if let Some(len) = raw_name.strip_prefix("#1/") {
+                    // A BSD name sits in the member data, which a thin archive lacks.
+                    ensure!(
+                        !self.thin,
+                        "thin archive member uses a BSD inline name: {raw_name:?}"
+                    );
                     ensure!(
                         !len.is_empty() && len.bytes().all(|byte| byte.is_ascii_digit()),
                         "invalid BSD extended name: {raw_name:?}"
@@ -266,7 +297,14 @@ impl<'a> ArchiveMember<'a> {
     }
 
     /// Skip any BSD inline filename so the returned bytes start at the ELF header.
+    ///
+    /// A thin archive member's bytes live in the file its name points to, so
+    /// the caller must map that file instead.
     pub(crate) fn object_bytes(&self) -> Result<&'a [u8]> {
+        ensure!(
+            !self.thin,
+            "thin archive member bytes are in a separate file"
+        );
         let payload = self.payload()?;
 
         match self.member_name()? {
@@ -290,6 +328,16 @@ impl<'a> ArchiveMember<'a> {
             self.member_name()?,
             MemberName::SymbolTable | MemberName::SymbolTable64 | MemberName::LongNameTable
         ))
+    }
+
+    /// Count the data bytes after the header in this file. A thin archive
+    /// stores data only for its armap and name table.
+    fn stored_size(&self) -> Result<usize> {
+        if self.thin && !self.is_special()? {
+            Ok(0)
+        } else {
+            self.size()
+        }
     }
 
     fn header_field(&self, offset: usize, len: usize) -> &'a [u8] {
@@ -323,6 +371,7 @@ impl<'reader, 'data> Iterator for ArchiveIter<'reader, 'data> {
         let member = ArchiveMember {
             data: self.reader.data,
             offset: self.offset,
+            thin: self.reader.thin,
         };
 
         if member.header_field(AR_FMAG_OFFSET, AR_FMAG_LEN) != AR_FMAG.as_slice() {
@@ -438,7 +487,7 @@ mod tests {
     //! Check GNU/BSD names, armap word sizes, padding, and bad member ranges.
 
     use super::*;
-    use crate::test_utils::{TestSymbol, build_archive, build_rel_object};
+    use crate::test_utils::{TestSymbol, build_archive, build_rel_object, build_thin_archive};
     use elf::{Elf64SymbolBinding, Elf64SymbolType};
 
     #[test]
@@ -480,10 +529,65 @@ mod tests {
     }
 
     #[test]
-    fn check_magic_only_accepts_archive_magic() {
-        assert!(check_magic(AR_MAGIC));
-        assert!(!check_magic(THIN_MAGIC));
-        assert!(!check_magic(b"\x7FELF"));
+    fn magic_tells_thin_archives_apart() {
+        assert!(!ArchiveReader::new(AR_MAGIC).unwrap().is_thin());
+        assert!(ArchiveReader::new(THIN_MAGIC).unwrap().is_thin());
+        assert!(ArchiveReader::new(b"\x7FELF").is_err());
+    }
+
+    #[test]
+    fn thin_member_headers_follow_each_other() {
+        // The size fields claim odd file sizes, but no member data follows.
+        let archive =
+            build_thin_archive(&[("../obj/a.o", 1201), ("b.o", 7)], &[("b", 1), ("a", 0)]);
+        let reader = ArchiveReader::new(&archive).unwrap();
+        let long_names = reader.long_name_table().unwrap();
+        let members = reader
+            .object_members()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.resolved_name(long_names).unwrap())
+                .collect::<Vec<_>>(),
+            ["../obj/a.o", "b.o"]
+        );
+        assert_eq!(members[0].size().unwrap(), 1201);
+        assert!(members[0].object_bytes().is_err());
+        let symbols = reader.symbol_table().unwrap().unwrap();
+        assert_eq!(symbols[0].member_offset, members[1].header_offset());
+        assert_eq!(symbols[1].member_offset, members[0].header_offset());
+    }
+
+    #[test]
+    fn long_name_reference_may_keep_a_stray_slash() {
+        // GNU ar leaves this `/` behind for a 15-byte name such as gconv_builtin.o.
+        let mut archive = Vec::from(THIN_MAGIC.as_slice());
+        push_member_with_trailer(&mut archive, "//", b"../gconv_builtin.o/\n", AR_FMAG);
+        push_member_with_trailer(&mut archive, "/0             /", &[], AR_FMAG);
+        let reader = ArchiveReader::new(&archive).unwrap();
+        let member = reader.object_members().next().unwrap().unwrap();
+
+        assert_eq!(member.member_name().unwrap(), MemberName::LongNameOffset(0));
+        assert_eq!(
+            member
+                .resolved_name(reader.long_name_table().unwrap())
+                .unwrap(),
+            "../gconv_builtin.o"
+        );
+    }
+
+    #[test]
+    fn thin_archives_reject_member_names_that_need_data() {
+        for (name, message) in [("#1/5", "BSD inline name"), ("/0:180", "nested archive")] {
+            let mut archive = Vec::from(THIN_MAGIC.as_slice());
+            push_member_with_trailer(&mut archive, name, &[], AR_FMAG);
+            let reader = ArchiveReader::new(&archive).unwrap();
+            let error = reader.iter().next().unwrap().unwrap_err();
+            assert!(error.to_string().contains(message), "{name}: {error}");
+        }
     }
 
     #[test]

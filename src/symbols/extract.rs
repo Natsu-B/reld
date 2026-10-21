@@ -67,18 +67,19 @@ pub(crate) fn extract_archive_members<'a>(
                         {
                             continue;
                         }
-                        let member = &archive.members[member_index];
-                        let display_name = format!("{}({})", archive.file_name, member.name);
+                        let name = archive.members[member_index].name.clone();
                         let file_id = FileId::ArchiveMember {
                             archive_index: archive.archive_index,
                             member_index,
                         };
-                        let object = object::parse(member.bytes, display_name.clone(), file_id)
-                            .with_context(|| {
-                                format!("failed to parse archive member {display_name}")
-                            })?;
+                        let object = object::parse(
+                            archive.member_bytes(member_index)?,
+                            name.clone(),
+                            file_id,
+                        )
+                        .with_context(|| format!("failed to parse archive member {name}"))?;
                         extractions.push(ArchiveExtraction {
-                            member: display_name,
+                            member: name,
                             symbol: entry.symbol.to_string(),
                             referencer: unresolved[entry.symbol],
                         });
@@ -171,7 +172,7 @@ mod tests {
         )
         .unwrap();
         let archive =
-            crate::input::archive::index::index_archive(archive, "libtest.a".to_string(), 1)
+            crate::input::archive::index::index_archive(archive, "libtest.a".to_string(), 1, &[])
                 .unwrap();
         extract_archive_members(
             LoadedInputs {

@@ -2,8 +2,9 @@
 //!
 //! [`build_rel_object`] takes [`TestSymbol`] and [`TestRelocation`] records and
 //! returns x86-64 ET_REL bytes. Archive builders wrap object bytes and can set
-//! armap order. Tests can thus check bad headers, unaligned members, and search
-//! order without running an assembler.
+//! armap order; the thin archive builder writes only member paths. Tests can
+//! thus check bad headers, unaligned members, and search order without running
+//! an assembler.
 //!
 //! References: ELF gABI "ELF Header", "Sections", "Symbol Table", and "Relocation";
 //! AMD64 psABI §4.4.1; GNU ar's member and index formats.
@@ -17,6 +18,8 @@ const SECTION_HEADER_SIZE: usize = 64;
 const SYMBOL_SIZE: usize = 24;
 const RELA_SIZE: usize = 24;
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
+const THIN_MAGIC: &[u8; 8] = b"!<thin>\n";
+const AR_HEADER_SIZE: usize = 60;
 
 /// Choose the input symbol fields a test needs; the builder adds its name to .strtab.
 #[derive(Clone, Copy)]
@@ -188,6 +191,16 @@ pub(crate) fn build_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+fn push_header(out: &mut Vec<u8>, name: &str, size: usize) {
+    push_field(out, 16, name.as_bytes());
+    push_field(out, 12, b"0");
+    push_field(out, 6, b"0");
+    push_field(out, 6, b"0");
+    push_field(out, 8, b"100644");
+    push_field(out, 10, size.to_string().as_bytes());
+    out.extend_from_slice(&AR_FMAG);
+}
+
 fn write_u16(out: &mut [u8], offset: usize, value: u16) {
     out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -211,13 +224,7 @@ fn push_field(out: &mut Vec<u8>, width: usize, value: &[u8]) {
 }
 
 fn push_member(out: &mut Vec<u8>, name: &str, payload: &[u8]) {
-    push_field(out, 16, name.as_bytes());
-    push_field(out, 12, b"0");
-    push_field(out, 6, b"0");
-    push_field(out, 6, b"0");
-    push_field(out, 8, b"100644");
-    push_field(out, 10, payload.len().to_string().as_bytes());
-    out.extend_from_slice(&AR_FMAG);
+    push_header(out, name, payload.len());
     out.extend_from_slice(payload);
     if payload.len() % 2 != 0 {
         out.push(b'\n');
@@ -234,11 +241,11 @@ pub(crate) fn build_indexed_archive(
         .map(|(name, _)| name.len() + 1)
         .sum::<usize>();
     let table_size = 4 + entries.len() * 4 + names_size;
-    let mut offset = AR_MAGIC.len() + 60 + table_size + table_size % 2;
+    let mut offset = AR_MAGIC.len() + AR_HEADER_SIZE + table_size + table_size % 2;
     let mut offsets = Vec::new();
     for (_, bytes) in members {
         offsets.push(offset as u32);
-        offset += 60 + bytes.len() + bytes.len() % 2;
+        offset += AR_HEADER_SIZE + bytes.len() + bytes.len() % 2;
     }
     let mut table = Vec::new();
     table.extend_from_slice(&(entries.len() as u32).to_be_bytes());
@@ -252,4 +259,50 @@ pub(crate) fn build_indexed_archive(
     let mut indexed_members = vec![("/", table.as_slice())];
     indexed_members.extend_from_slice(members);
     build_archive(&indexed_members)
+}
+
+/// Build a thin archive: each member is a path and the size its header claims.
+///
+/// Like GNU ar, put every path in the `//` table and write no member data.
+/// Armap entries name members by index; leave them empty to omit the armap.
+pub(crate) fn build_thin_archive(members: &[(&str, usize)], entries: &[(&str, usize)]) -> Vec<u8> {
+    let mut long_names = Vec::new();
+    let mut name_offsets = Vec::new();
+    for (path, _) in members {
+        name_offsets.push(long_names.len());
+        long_names.extend_from_slice(path.as_bytes());
+        long_names.extend_from_slice(b"/\n");
+    }
+    let names_size = entries
+        .iter()
+        .map(|(name, _)| name.len() + 1)
+        .sum::<usize>();
+    let table_size = 4 + entries.len() * 4 + names_size;
+    let mut offset = THIN_MAGIC.len() + AR_HEADER_SIZE + long_names.len() + long_names.len() % 2;
+    if !entries.is_empty() {
+        offset += AR_HEADER_SIZE + table_size + table_size % 2;
+    }
+    // Member headers follow one another with no data in between.
+    let member_offsets = (0..members.len())
+        .map(|index| (offset + index * AR_HEADER_SIZE) as u32)
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::from(THIN_MAGIC.as_slice());
+    if !entries.is_empty() {
+        let mut table = Vec::new();
+        table.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (_, member_index) in entries {
+            table.extend_from_slice(&member_offsets[*member_index].to_be_bytes());
+        }
+        for (name, _) in entries {
+            table.extend_from_slice(name.as_bytes());
+            table.push(0);
+        }
+        push_member(&mut out, "/", &table);
+    }
+    push_member(&mut out, "//", &long_names);
+    for ((_, size), name_offset) in members.iter().zip(name_offsets) {
+        push_header(&mut out, &format!("/{name_offset}"), *size);
+    }
+    out
 }

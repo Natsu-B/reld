@@ -155,6 +155,23 @@ pub fn create_archive(dir: &TempDir, stem: &str, members: &[&Path]) -> PathBuf {
     archive_path
 }
 
+/// Make a thin archive with `ar crsT`, running in `dir` so `ar` stores each
+/// member path relative to the archive's directory, as a build tree does.
+#[allow(dead_code)]
+pub fn create_thin_archive(dir: &TempDir, archive: &str, members: &[&str]) -> PathBuf {
+    assert_linux_host();
+
+    let mut command = StdCommand::new("ar");
+    command
+        .current_dir(dir.path())
+        .arg("crsT")
+        .arg(archive)
+        .args(members);
+    run_tool(command, &format!("archive {archive}"));
+
+    dir.path().join(archive)
+}
+
 #[allow(dead_code)]
 pub fn link_executable_input(dir: &TempDir, output_name: &str, inputs: &[&Path]) -> PathBuf {
     assert_linux_host();
@@ -201,6 +218,7 @@ pub fn cargo_linker() -> Command {
     command
 }
 
+#[allow(dead_code)]
 pub fn cargo_linker_with_debug(debug: u8) -> Command {
     let mut command = cargo_linker();
     command.arg("--debug").arg(debug.to_string());
@@ -218,6 +236,7 @@ pub fn read_output_bytes(path: &Path) -> Vec<u8> {
     })
 }
 
+#[allow(dead_code)]
 pub fn parse_elf64<'a>(bytes: &'a [u8]) -> Elf64<'a> {
     Elf64::new(bytes).unwrap_or_else(|err| {
         panic!("failed to parse ELF output: {err:#}");

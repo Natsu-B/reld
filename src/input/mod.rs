@@ -2,7 +2,9 @@
 //!
 //! [`load`] takes paths and returns [`LoadedInputs`] in command-line order.
 //! Rayon opens and reads separate files in parallel. [`MappedFiles`] owns the
-//! memory maps while names and section bytes borrow them.
+//! memory maps while names and section bytes borrow them. A thin archive names
+//! other files for its members, so we map those here too; later stages never
+//! open files.
 //!
 //! An ELF `ET_REL` file holds code whose addresses still need patches. An archive
 //! holds such objects and a symbol index, called an armap. [`InputFile`] keeps
@@ -32,7 +34,10 @@ pub(crate) enum InputFile<'a> {
 /// Own the maps while parsed names and section bytes borrow from them.
 #[derive(Default)]
 pub(crate) struct MappedFiles {
-    mappings: Vec<Mmap>,
+    /// One map per command-line path, in the same order.
+    inputs: Vec<Mmap>,
+    /// For each input, the member files of a thin archive; empty for other inputs.
+    thin_members: Vec<Vec<archive::thin::MemberFile>>,
 }
 
 /// Keep command-line order, which sets when archive search sees each reference.
@@ -46,18 +51,28 @@ pub(crate) struct LoadedInputs<'a> {
 /// Report every file error before returning a failed stage.
 pub(crate) fn load<'a>(paths: &[String], storage: &'a mut MappedFiles) -> Result<LoadedInputs<'a>> {
     let opened = paths.par_iter().map(open::open_file_and_mmap).collect();
-    storage.mappings = collect_results(opened, paths, "open")?;
-    let parsed = storage
-        .mappings
+    storage.inputs = collect_results(opened, paths, "open")?;
+    let members = storage
+        .inputs
         .par_iter()
         .zip(paths.par_iter())
+        .map(|(bytes, path)| archive::thin::map_members(bytes, path))
+        .collect();
+    storage.thin_members = collect_results(members, paths, "read")?;
+
+    let storage = &*storage;
+    let parsed = storage
+        .inputs
+        .par_iter()
+        .zip(storage.thin_members.par_iter())
+        .zip(paths.par_iter())
         .enumerate()
-        .map(|(input_index, (bytes, path))| {
+        .map(|(input_index, ((bytes, thin_members), path))| {
             if elf::Elf64::check_elf_magic(bytes) {
                 object::parse(bytes, path.clone(), FileId::InputObject { input_index })
                     .map(InputFile::Object)
             } else {
-                archive::index::index_archive(bytes, path.clone(), input_index)
+                archive::index::index_archive(bytes, path.clone(), input_index, thin_members)
                     .map(InputFile::Archive)
             }
         })

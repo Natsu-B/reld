@@ -4,6 +4,7 @@ mod common;
 
 use std::{fs, path::Path, process::Command};
 
+use common::map::archive_section;
 use common::toolchain::{
     assemble_object, cargo_linker, cargo_linker_with_debug, compile_c_object, create_archive,
     glibc_static_toolchain, parse_elf64, read_output_bytes, run_executable,
@@ -250,21 +251,6 @@ fn unknown_trace_phase_lists_valid_names_before_opening_inputs() {
         .stderr(predicates::str::contains(
             "unknown trace phase 'bogus'; valid phases: inputs, archive, symbols, mapping, got, layout, relocations",
         ));
-}
-
-fn archive_section(map: &str) -> String {
-    let mut lines = map.lines();
-    assert_eq!(
-        lines.next(),
-        Some("Archive member included to satisfy reference by file (symbol)")
-    );
-    assert_eq!(lines.next(), Some(""));
-    // The next blank line terminates GNU ld's archive section. Only trailing
-    // whitespace is ignored; paths, order, wrapping and indentation must agree.
-    lines
-        .take_while(|line| !line.trim_end().is_empty())
-        .map(|line| format!("{}\n", line.trim_end()))
-        .collect()
 }
 
 #[test]
