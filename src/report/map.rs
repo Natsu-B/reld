@@ -65,9 +65,10 @@ fn archive_preamble(report: &Reporter) -> String {
         String::from("Archive member included to satisfy reference by file (symbol)\n\n");
     for extraction in &report.extractions {
         write!(text, "{}", extraction.member).unwrap();
-        // Match GNU ld: the requesting file starts in column 30; long member
-        // names force it onto the next line.
-        if extraction.member.len() >= 30 {
+        // Match GNU ld: the requesting file starts in column 30. Once a member
+        // name reaches 29 bytes, GNU ld moves the file to the next line, so at
+        // least two spaces always follow a name that shares its line.
+        if extraction.member.len() >= 29 {
             text.push('\n');
             text.push_str(&" ".repeat(30));
         } else {
@@ -80,4 +81,41 @@ fn archive_preamble(report: &Reporter) -> String {
     }
     text.push('\n');
     text
+}
+
+#[cfg(test)]
+mod tests {
+    //! Check GNU ld's column rule for the archive list.
+
+    use super::*;
+    use crate::{input::FileId, report::Options, symbols::ArchiveExtraction};
+
+    #[test]
+    fn member_names_of_29_bytes_push_the_file_to_the_next_line() {
+        let mut report = Reporter::new(Options {
+            trace: Vec::new(),
+            trace_symbol: Vec::new(),
+            map: None,
+        });
+        let main = FileId::InputObject { input_index: 0 };
+        report.files.insert(main, "main.o".to_string());
+        for member in ["a".repeat(28), "b".repeat(29)] {
+            report.extractions.push(ArchiveExtraction {
+                member,
+                symbol: "f".to_string(),
+                referencer: Some(main),
+            });
+        }
+
+        assert_eq!(
+            archive_preamble(&report),
+            format!(
+                "Archive member included to satisfy reference by file (symbol)\n\n\
+                 {}  main.o (f)\n{}\n{}main.o (f)\n\n",
+                "a".repeat(28),
+                "b".repeat(29),
+                " ".repeat(30)
+            )
+        );
+    }
 }
