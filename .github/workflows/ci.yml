@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Run the tests in the flake's dev shell, the same toolchain as local work.
+  nix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix develop -c cargo fmt --check
+      - run: nix develop -c cargo test
+
+  # Ubuntu's gcc and glibc differ from the Nix ones, so tests that assume one
+  # toolchain's crt files or libc.a fail here.
+  ubuntu:
+    runs-on: ubuntu-24.04
+    env:
+      GLIBC_STATIC_LIB_DIR: /usr/lib/x86_64-linux-gnu
+      GLIBC_CRT_DIR: /usr/lib/x86_64-linux-gnu
+      GLIBC_INCLUDE_DIR: /usr/include
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: echo "LIBGCC_DIR=$(dirname "$(gcc -print-libgcc-file-name)")" >> "$GITHUB_ENV"
+      - run: cargo test
