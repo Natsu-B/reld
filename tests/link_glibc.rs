@@ -111,6 +111,17 @@ fn links_static_glibc_hello_world() {
             .collect::<BTreeSet<_>>()
     };
     assert_eq!(globals(&elf), globals(&baseline_elf));
+    let symbol_values = |image: &elf::Elf64| {
+        let table = image
+            .sections()
+            .find(|section| section.name().unwrap() == ".symtab")
+            .unwrap();
+        table
+            .symbols()
+            .unwrap()
+            .map(|symbol| (symbol.name().unwrap().to_string(), symbol.value()))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
     for image in [&elf, &baseline_elf] {
         let relocations = image
             .sections()
@@ -123,28 +134,22 @@ fn links_static_glibc_hello_world() {
                 .unwrap()
                 .all(|relocation| relocation.info().ty == 37)
         );
-        let table = image
-            .sections()
-            .find(|section| section.name().unwrap() == ".symtab")
-            .unwrap();
-        let symbols = table
-            .symbols()
-            .unwrap()
-            .map(|symbol| (symbol.name().unwrap().to_string(), symbol.value()))
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(
-            symbols["__init_array_end"] - symbols["__init_array_start"],
-            16
-        );
-        assert_eq!(
-            symbols["__fini_array_end"] - symbols["__fini_array_start"],
-            16
-        );
+        let symbols = symbol_values(image);
         assert_eq!(
             symbols["__rela_iplt_end"] - symbols["__rela_iplt_start"],
             relocations.size()
         );
     }
+    // crtbeginT.o adds one entry to each array and libc.a may add more, so the
+    // sizes depend on the toolchain. Expect the sizes GNU ld chose.
+    let array_sizes = |image: &elf::Elf64| {
+        let symbols = symbol_values(image);
+        [
+            symbols["__init_array_end"] - symbols["__init_array_start"],
+            symbols["__fini_array_end"] - symbols["__fini_array_start"],
+        ]
+    };
+    assert_eq!(array_sizes(&elf), array_sizes(&baseline_elf));
     let relocation_count = |image: &elf::Elf64| {
         image
             .sections()
