@@ -210,8 +210,8 @@ pub fn link_static_executable_input(dir: &TempDir, output_name: &str, inputs: &[
 }
 
 pub fn cargo_linker() -> Command {
-    let mut command = Command::cargo_bin("my_linker").unwrap_or_else(|err| {
-        panic!("failed to locate my_linker test binary: {err}");
+    let mut command = Command::cargo_bin("reld").unwrap_or_else(|err| {
+        panic!("failed to locate reld test binary: {err}");
     });
     command.env("NO_COLOR", "1");
     command.env("RAYON_NUM_THREADS", "1");

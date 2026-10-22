@@ -4,7 +4,7 @@ use tempfile::tempdir;
 
 #[test]
 fn help_works() {
-    let mut command = Command::cargo_bin("my_linker").unwrap();
+    let mut command = Command::cargo_bin("reld").unwrap();
     command.env("NO_COLOR", "1");
     command.env("RAYON_NUM_THREADS", "1");
     command.arg("--help").assert().success();
@@ -15,7 +15,7 @@ fn missing_input_file_fails() {
     let temp = tempdir().unwrap();
     let output = temp.path().join("out");
 
-    let mut command = Command::cargo_bin("my_linker").unwrap();
+    let mut command = Command::cargo_bin("reld").unwrap();
     command.env("NO_COLOR", "1");
     command.env("RAYON_NUM_THREADS", "1");
 

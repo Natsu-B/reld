@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 typestate = { git = "https://github.com/Natsu-B/aarch64_type1_hypervisor.git" }
 typestate_macro = { git = "https://github.com/Natsu-B/aarch64_type1_hypervisor.git" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
