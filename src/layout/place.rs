@@ -420,7 +420,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        input::object::InputSection,
+        input::{FileNames, object::InputSection},
         layout::{segments::load_segment_count, tls::TlsSegment},
         script::{
             mapping::{input_name, map_inputs},
@@ -588,7 +588,8 @@ mod tests {
             other: 0,
             value: 0,
         };
-        let symbols = crate::symbols::resolve_inputs(&[input_symbol], &[]).unwrap();
+        let symbols =
+            crate::symbols::resolve_inputs(&[input_symbol], &[], &FileNames::default()).unwrap();
         let script = parser::parse(
             "SECTIONS {
                 . = 0x401000;

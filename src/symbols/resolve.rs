@@ -1,6 +1,7 @@
 //! Pick one definition for each global name before addresses exist.
 //!
-//! [`resolve`] takes a [`SectionMapping`] and returns a [`SymbolTable`].
+//! [`resolve`] takes a [`SectionMapping`] and returns a [`SymbolTable`];
+//! [`FileNames`] only lets errors name the file the user gave.
 //! References to one global share a [`SymbolId`]; local symbols stay tied to
 //! their input file. A strong definition beats a weak one. Two strong definitions
 //! or a missing strong definition cause an error; a missing weak one gets zero.
@@ -20,7 +21,7 @@ use elf::{Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64Symbo
 
 use super::table::{Definition, SymbolId, SymbolTable};
 use crate::{
-    input::object::ObjectSymbol,
+    input::{FileNames, object::ObjectSymbol},
     script::{
         ast::{Assignment, AssignmentKind},
         mapping::SectionMapping,
@@ -28,8 +29,8 @@ use crate::{
 };
 
 /// Pick definitions from the mapped inputs and script assignments, before layout.
-pub(crate) fn resolve(mapping: &SectionMapping) -> Result<SymbolTable> {
-    resolve_inputs(&mapping.symbols, &mapping.assignments())
+pub(crate) fn resolve(mapping: &SectionMapping, names: &FileNames) -> Result<SymbolTable> {
+    resolve_inputs(&mapping.symbols, &mapping.assignments(), names)
 }
 
 /// Give each global name one definition and keep local symbols separate.
@@ -40,18 +41,19 @@ pub(crate) fn resolve(mapping: &SectionMapping) -> Result<SymbolTable> {
 pub(crate) fn resolve_inputs(
     symbols: &[ObjectSymbol],
     assignments: &[&Assignment],
+    names: &FileNames,
 ) -> Result<SymbolTable> {
     pr_debug!("Resolving symbol names...");
     let mut table = SymbolTable::default();
     let mut definitions: HashMap<&str, &ObjectSymbol> = HashMap::new();
     let mut references = HashSet::new();
     for symbol in symbols {
-        let binding = symbol_binding(symbol)?;
+        let binding = symbol_binding(symbol, names)?;
         ensure!(
             symbol.section_idx != Elf64SymbolSectionIdx::Common,
             "unsupported common symbol: {} in file: {}",
             symbol.name,
-            symbol.file_id
+            names.show(symbol.file_id)
         );
         if symbol.name.is_empty() || binding == Elf64SymbolBinding::STB_LOCAL {
             continue;
@@ -67,8 +69,8 @@ pub(crate) fn resolve_inputs(
                 bail!(
                     "multiple definition of symbol: {} in files: {} and {}",
                     symbol.name,
-                    symbol.file_id,
-                    old.file_id
+                    names.show(symbol.file_id),
+                    names.show(old.file_id)
                 );
             }
             if !weak {
@@ -85,7 +87,7 @@ pub(crate) fn resolve_inputs(
             .get(symbol.name)
             .is_some_and(|winner| std::ptr::eq(*winner, symbol))
         {
-            let id = insert_input(&mut table, symbol)?;
+            let id = insert_input(&mut table, symbol, names)?;
             table.by_name.insert(symbol.name.to_string(), id);
         }
     }
@@ -150,7 +152,7 @@ pub(crate) fn resolve_inputs(
             bail!(
                 "undefined symbol: {} in file: {}",
                 symbol.name,
-                symbol.file_id
+                names.show(symbol.file_id)
             );
         }
     }
@@ -174,7 +176,7 @@ pub(crate) fn resolve_inputs(
                 bail!(
                     "undefined symbol: {} in file: {}",
                     symbol.name,
-                    symbol.file_id
+                    names.show(symbol.file_id)
                 );
             }
         } else if symbol.section_idx == Elf64SymbolSectionIdx::Undefined {
@@ -188,14 +190,14 @@ pub(crate) fn resolve_inputs(
                 Definition::UndefinedWeak,
             )
         } else {
-            insert_input(&mut table, symbol)?
+            insert_input(&mut table, symbol, names)?
         };
         table.by_input.insert((symbol.file_id, symbol.idx), id);
     }
     Ok(table)
 }
 
-fn symbol_binding(symbol: &ObjectSymbol) -> Result<Elf64SymbolBinding> {
+fn symbol_binding(symbol: &ObjectSymbol, names: &FileNames) -> Result<Elf64SymbolBinding> {
     match symbol.info.get_enum(Elf64SymbolInfo::st_bind) {
         Some(
             binding @ (Elf64SymbolBinding::STB_LOCAL
@@ -206,16 +208,20 @@ fn symbol_binding(symbol: &ObjectSymbol) -> Result<Elf64SymbolBinding> {
             "unsupported symbol binding {} for symbol: {} in file: {} (expected LOCAL, GLOBAL, or WEAK)",
             symbol.info.get(Elf64SymbolInfo::st_bind),
             symbol.name,
-            symbol.file_id
+            names.show(symbol.file_id)
         ),
     }
 }
 
-fn insert_input(table: &mut SymbolTable, symbol: &ObjectSymbol) -> Result<SymbolId> {
+fn insert_input(
+    table: &mut SymbolTable,
+    symbol: &ObjectSymbol,
+    names: &FileNames,
+) -> Result<SymbolId> {
     Ok(table.insert(
         symbol.name,
         symbol.info.get_enum(Elf64SymbolInfo::st_type),
-        symbol_binding(symbol)?,
+        symbol_binding(symbol, names)?,
         symbol.size,
         symbol.other,
         Definition::Input {
@@ -266,7 +272,10 @@ mod tests {
                 Elf64SymbolSectionIdx::AbsoluteSymbols,
             );
             input.info = input.info.set(Elf64SymbolInfo::st_bind, binding);
-            let error = resolve_inputs(&[input], &[]).err().unwrap().to_string();
+            let error = resolve_inputs(&[input], &[], &FileNames::default())
+                .err()
+                .unwrap()
+                .to_string();
             assert!(error.contains(&format!("unsupported symbol binding {binding}")));
             assert!(error.contains("unsupported"));
             assert!(error.contains("file:"));
@@ -297,7 +306,7 @@ mod tests {
             Elf64SymbolSectionIdx::Undefined,
         );
         let symbols = vec![weak, strong, reference];
-        let table = resolve_inputs(&symbols, &[]).unwrap();
+        let table = resolve_inputs(&symbols, &[], &FileNames::default()).unwrap();
         let id = table
             .input(FileId::InputObject { input_index: 0 }, 1)
             .unwrap();
@@ -332,7 +341,7 @@ mod tests {
                 Elf64SymbolSectionIdx::Undefined,
             )
         });
-        let table = resolve_inputs(&symbols, &[]).unwrap();
+        let table = resolve_inputs(&symbols, &[], &FileNames::default()).unwrap();
         let id = table
             .input(FileId::InputObject { input_index: 0 }, 1)
             .unwrap();
@@ -367,7 +376,9 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
-            let error = resolve_inputs(&symbols, &[]).err().unwrap();
+            let error = resolve_inputs(&symbols, &[], &FileNames::default())
+                .err()
+                .unwrap();
             assert!(error.to_string().contains("undefined symbol: missing"));
         }
     }
@@ -383,7 +394,9 @@ mod tests {
                 Elf64SymbolSectionIdx::Index(1),
             )
         });
-        let error = resolve_inputs(&symbols, &[]).err().unwrap();
+        let error = resolve_inputs(&symbols, &[], &FileNames::default())
+            .err()
+            .unwrap();
         assert!(
             error
                 .to_string()
@@ -412,7 +425,7 @@ mod tests {
                 assignment
             })
             .collect::<Vec<_>>();
-        let table = resolve_inputs(&symbols, &assignments).unwrap();
+        let table = resolve_inputs(&symbols, &assignments, &FileNames::default()).unwrap();
         assert!(table.should_assign(assignments[0]));
         assert_eq!(table.should_assign(assignments[1]), false);
         let id = table
@@ -442,7 +455,7 @@ mod tests {
             Elf64SymbolType::STT_TLS,
             Elf64SymbolSectionIdx::Index(1),
         )];
-        let table = resolve_inputs(&symbols, &[]).unwrap();
+        let table = resolve_inputs(&symbols, &[], &FileNames::default()).unwrap();
         assert_eq!(
             table.named("tls").unwrap().ty,
             Some(Elf64SymbolType::STT_TLS)

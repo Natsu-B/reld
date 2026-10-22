@@ -77,9 +77,11 @@ fn main() -> anyhow::Result<()> {
     report.inputs(&files)?;
     let objects = symbols::extract_archive_members(files, script.entry_name())?;
     report.archive(&objects)?;
+    // Mapping consumes the objects, but errors still need their file names.
+    let names = input::FileNames::new(&objects.files);
     let mapping = script::map_sections(&script, objects)?;
     report.mapping(&mapping)?;
-    let symbols = symbols::resolve(&mapping)?;
+    let symbols = symbols::resolve(&mapping, &names)?;
     report.symbols(&symbols)?;
     let synthetic = synthetic::build(mapping, &symbols)?;
     report.synthetic(&synthetic, &symbols)?;

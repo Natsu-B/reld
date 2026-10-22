@@ -33,7 +33,10 @@ _start:
         .arg(&input)
         .assert()
         .failure()
-        .stderr(contains("undefined symbol"));
+        .stderr(contains(format!(
+            "undefined symbol: foo in file: {}",
+            input.display()
+        )));
 }
 
 #[test]
@@ -74,7 +77,11 @@ foo:
         .arg(&second)
         .assert()
         .failure()
-        .stderr(contains("multiple definition"));
+        .stderr(contains(format!(
+            "multiple definition of symbol: foo in files: {} and {}",
+            second.display(),
+            first.display()
+        )));
 }
 
 #[test]

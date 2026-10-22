@@ -23,7 +23,7 @@ use anyhow::{Result, ensure};
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-pub(crate) use file_id::FileId;
+pub(crate) use file_id::{FileId, FileNames};
 
 /// An object enters the link at once; an archive waits for a needed symbol.
 pub(crate) enum InputFile<'a> {

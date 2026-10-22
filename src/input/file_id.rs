@@ -3,12 +3,15 @@
 //! [`FileId`] names a command-line object, an archive member, or linker-made input.
 //! ELF numbers sections and symbols within each object. A file ID plus that
 //! number gives later steps a key that works even when two files both have a
-//! local `loop` symbol or a section numbered one.
+//! local `loop` symbol or a section numbered one. [`FileNames`] maps each ID
+//! back to the name the user gave, so errors can say which file to fix.
 //!
 //! References: ELF gABI "Sections" and "Symbol Table". GNU ld names archive
 //! members as `lib.a(member.o)`; diagnostics keep both parts too.
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
+
+use super::object::ObjectFile;
 
 /// An ELF index is unique only within its file, so lookups also need this ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,5 +39,28 @@ impl fmt::Display for FileId {
                 write!(f, "input[{archive_index}] (archive member[{member_index}])")
             }
         }
+    }
+}
+
+/// Name files the way the user typed them, such as `main.o` or `lib.a(put.o)`.
+///
+/// Errors should say which file to fix. A [`FileId`] alone only gives the
+/// position on the command line, so keep the names after archive search.
+#[derive(Default)]
+pub(crate) struct FileNames(HashMap<FileId, String>);
+
+impl FileNames {
+    pub(crate) fn new(objects: &[ObjectFile]) -> Self {
+        Self(
+            objects
+                .iter()
+                .map(|object| (object.file_id, object.file_name.clone()))
+                .collect(),
+        )
+    }
+
+    /// Fall back to the [`FileId`] form for a file with no recorded name.
+    pub(crate) fn show(&self, id: FileId) -> String {
+        self.0.get(&id).cloned().unwrap_or_else(|| id.to_string())
     }
 }
