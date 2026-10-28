@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command as StdCommand,
@@ -84,8 +85,7 @@ pub struct GlibcStaticToolchain {
 
 #[allow(dead_code)]
 impl GlibcStaticToolchain {
-    /// Inputs in the same order `gcc -static` passes them to the linker.
-    /// libc.a appears twice to resolve its circular dependency on libgcc.
+    /// Resolve the libc.a/libgcc.a cycle without a group by repeating libc.a.
     pub fn link_inputs<'a>(&'a self, objects: &[&'a Path]) -> Vec<&'a Path> {
         let mut inputs = vec![
             self.crt1.as_path(),
@@ -100,6 +100,26 @@ impl GlibcStaticToolchain {
             self.libc.as_path(),
             self.crtend.as_path(),
             self.crtn.as_path(),
+        ]);
+        inputs
+    }
+
+    /// Inputs and archive group options in the order `gcc -static` uses.
+    pub fn grouped_link_inputs(&self, objects: &[&Path]) -> Vec<OsString> {
+        let mut inputs = vec![
+            self.crt1.clone().into_os_string(),
+            self.crti.clone().into_os_string(),
+            self.crtbegin_t.clone().into_os_string(),
+        ];
+        inputs.extend(objects.iter().map(|object| object.as_os_str().to_owned()));
+        inputs.extend([
+            "--start-group".into(),
+            self.libgcc.clone().into_os_string(),
+            self.libgcc_eh.clone().into_os_string(),
+            self.libc.clone().into_os_string(),
+            "--end-group".into(),
+            self.crtend.clone().into_os_string(),
+            self.crtn.clone().into_os_string(),
         ]);
         inputs
     }
@@ -230,6 +250,7 @@ pub fn run_executable(path: &Path) -> assert_cmd::assert::Assert {
     Command::new(path).assert()
 }
 
+#[allow(dead_code)]
 pub fn read_output_bytes(path: &Path) -> Vec<u8> {
     fs::read(path).unwrap_or_else(|err| {
         panic!("failed to read output file {}: {err}", path.display());

@@ -1,24 +1,34 @@
 //! Pull archive members that define needed symbols.
 //!
-//! [`extract_archive_members`] takes [`LoadedInputs`] and the entry name. It
-//! returns [`ExtractedObjects`] and [`ArchiveExtraction`] reasons. A strong
-//! undefined reference requires a definition. A weak reference is optional, so
-//! it does not pull a member. ENTRY supplies the first required name.
+//! [`extract_archive_members`] takes [`LoadedInputs`], group ranges, and the
+//! entry name. It returns [`ExtractedObjects`] and [`ArchiveExtraction`] reasons.
+//! A strong undefined reference requires a definition. A weak reference is
+//! optional, so it does not pull a member. ENTRY supplies the first required name.
 //!
 //! Like GNU ld/BFD, we visit each archive at its input position and scan the
 //! armap from start to end. A member can add new references. Later armap entries
 //! can meet them in that pass; earlier entries wait for the next pass. We stop
-//! after a pass pulls nothing and do not revisit an earlier archive.
+//! after a pass pulls nothing. Outside a group, search never returns to that
+//! archive, so it cannot meet a reference from a later input.
+//!
+//! Static glibc has a cycle: libc.a needs helpers from libgcc.a, and those
+//! helpers need libc.a again. A group repeats searches in command-line order
+//! until a full pass pulls nothing. Objects enter only at their first position.
+//! `gcc -static` passes `--start-group -lgcc -lgcc_eh -lc --end-group`.
 //!
 //! References: ELF gABI "Symbol Binding";
-//! [GNU ld archive search](https://sourceware.org/binutils/docs/ld/Options.html).
+//! [GNU ld archive search and `--start-group`](https://sourceware.org/binutils/docs/ld/Options.html).
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use anyhow::{Context, Result};
 
 use crate::input::{
     FileId, InputFile, LoadedInputs,
+    archive::index::ArchiveState,
     object::{self, ObjectFile},
 };
 
@@ -40,62 +50,93 @@ pub(crate) struct ArchiveExtraction {
 /// Scan each archive in full armap passes until a pass pulls no members.
 ///
 /// Strong undefined names, including ENTRY, pull members. Weak names do not.
-/// Finish this archive before moving to the next input; do not revisit it later.
+/// Groups repeat archive searches; other archives are searched only at their position.
 pub(crate) fn extract_archive_members<'a>(
     inputs: LoadedInputs<'a>,
     entry_name: &str,
+    groups: &[Range<usize>],
 ) -> Result<ExtractedObjects<'a>> {
-    let mut files = Vec::new();
-    let mut extractions = Vec::new();
+    let mut objects = ExtractedObjects {
+        files: Vec::new(),
+        extractions: Vec::new(),
+    };
     let mut defined = HashSet::new();
     // ENTRY must find a definition even before an input refers to it.
     let mut unresolved = HashMap::from([(entry_name.to_string(), None)]);
-    for input in inputs.files {
+    let mut groups = groups.iter().filter(|group| !group.is_empty()).peekable();
+    let mut archives = Vec::new();
+    for (index, input) in inputs.files.into_iter().enumerate() {
         match input {
             InputFile::Object(object) => {
                 update_symbol_sets(&object, &mut defined, &mut unresolved);
-                files.push(object);
+                objects.files.push(object);
             }
             InputFile::Archive(mut archive) => {
-                // BFD finishes each armap pass before restarting. New names
-                // can pull later entries here; earlier entries wait a pass.
-                loop {
-                    let mut loaded = false;
-                    for entry in &archive.entries {
-                        let member_index = entry.member_index;
-                        if archive.extracted[member_index] || !unresolved.contains_key(entry.symbol)
-                        {
-                            continue;
-                        }
-                        let name = archive.members[member_index].name.clone();
-                        let file_id = FileId::ArchiveMember {
-                            archive_index: archive.archive_index,
-                            member_index,
-                        };
-                        let object = object::parse(
-                            archive.member_bytes(member_index)?,
-                            name.clone(),
-                            file_id,
-                        )
-                        .with_context(|| format!("failed to parse archive member {name}"))?;
-                        extractions.push(ArchiveExtraction {
-                            member: name,
-                            symbol: entry.symbol.to_string(),
-                            referencer: unresolved[entry.symbol],
-                        });
-                        archive.extracted[member_index] = true;
-                        update_symbol_sets(&object, &mut defined, &mut unresolved);
-                        files.push(object);
-                        loaded = true;
-                    }
-                    if !loaded {
-                        break;
-                    }
+                search_archive(&mut archive, &mut objects, &mut defined, &mut unresolved)?;
+                if groups.peek().is_some_and(|group| group.contains(&index)) {
+                    archives.push(archive);
                 }
             }
         }
+        if groups.peek().is_some_and(|group| group.end == index + 1) {
+            // GNU ld repeats while its undefined list grows. If pulled members
+            // add no new strong undefined name, the next pass can pull nothing.
+            // Counting pulled members gives the same result with one extra empty pass.
+            loop {
+                let mut loaded = false;
+                for archive in &mut archives {
+                    loaded |= search_archive(archive, &mut objects, &mut defined, &mut unresolved)?;
+                }
+                if !loaded {
+                    break;
+                }
+            }
+            archives.clear();
+            groups.next();
+        }
     }
-    Ok(ExtractedObjects { files, extractions })
+    Ok(objects)
+}
+
+/// Repeat armap passes over one archive; return whether any member entered the link.
+fn search_archive<'a>(
+    archive: &mut ArchiveState<'a>,
+    objects: &mut ExtractedObjects<'a>,
+    defined: &mut HashSet<String>,
+    unresolved: &mut HashMap<String, Option<FileId>>,
+) -> Result<bool> {
+    let mut pulled = false;
+    // BFD finishes each armap pass before restarting. New names can pull
+    // later entries here; earlier entries wait a pass.
+    loop {
+        let mut loaded = false;
+        for entry in &archive.entries {
+            let member_index = entry.member_index;
+            if archive.extracted[member_index] || !unresolved.contains_key(entry.symbol) {
+                continue;
+            }
+            let name = archive.members[member_index].name.clone();
+            let file_id = FileId::ArchiveMember {
+                archive_index: archive.archive_index,
+                member_index,
+            };
+            let object = object::parse(archive.member_bytes(member_index)?, name.clone(), file_id)
+                .with_context(|| format!("failed to parse archive member {name}"))?;
+            objects.extractions.push(ArchiveExtraction {
+                member: name,
+                symbol: entry.symbol.to_string(),
+                referencer: unresolved[entry.symbol],
+            });
+            archive.extracted[member_index] = true;
+            update_symbol_sets(&object, defined, unresolved);
+            objects.files.push(object);
+            loaded = true;
+            pulled = true;
+        }
+        if !loaded {
+            return Ok(pulled);
+        }
+    }
 }
 
 fn update_symbol_sets(
@@ -143,7 +184,7 @@ fn update_symbol_sets(
 
 #[cfg(test)]
 mod tests {
-    //! Check armap pass order and why strong names pull members but weak names do not.
+    //! Check archive and group pass order, object positions, and strong references.
 
     use super::*;
     use crate::test_utils::{TestSymbol, build_rel_object};
@@ -179,12 +220,181 @@ mod tests {
                 files: vec![InputFile::Object(root), InputFile::Archive(archive)],
             },
             "_start",
+            &[],
         )
         .unwrap()
         .files
         .into_iter()
         .map(|object| object.file_name)
         .collect()
+    }
+
+    fn extract_inputs<'a>(
+        inputs: &[(&str, &'a [u8])],
+        groups: &[Range<usize>],
+    ) -> ExtractedObjects<'a> {
+        let files = inputs
+            .iter()
+            .enumerate()
+            .map(|(input_index, &(name, bytes))| {
+                if name.ends_with(".a") {
+                    InputFile::Archive(
+                        crate::input::archive::index::index_archive(
+                            bytes,
+                            name.to_string(),
+                            input_index,
+                            &[],
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    InputFile::Object(
+                        object::parse(bytes, name.to_string(), FileId::InputObject { input_index })
+                            .unwrap(),
+                    )
+                }
+            })
+            .collect();
+        extract_archive_members(LoadedInputs { files }, "_start", groups).unwrap()
+    }
+
+    fn names<'a>(objects: &'a ExtractedObjects<'_>) -> Vec<&'a str> {
+        objects
+            .files
+            .iter()
+            .map(|object| object.file_name.as_str())
+            .collect()
+    }
+
+    fn cycle_inputs() -> [Vec<u8>; 3] {
+        use Elf64SymbolBinding::STB_GLOBAL as Global;
+        let root = build_rel_object(&[symbol("_start", Global, 2), symbol("a", Global, 0)], &[]);
+        let a = build_rel_object(&[symbol("a", Global, 2), symbol("b", Global, 0)], &[]);
+        let a2 = build_rel_object(&[symbol("a2", Global, 2)], &[]);
+        let b = build_rel_object(&[symbol("b", Global, 2), symbol("a2", Global, 0)], &[]);
+        [
+            root,
+            crate::test_utils::build_indexed_archive(
+                &[("a.o/", &a), ("a2.o/", &a2)],
+                &[("a", 0), ("a2", 1)],
+            ),
+            crate::test_utils::build_indexed_archive(&[("b.o/", &b)], &[("b", 0)]),
+        ]
+    }
+
+    #[test]
+    fn a_group_resolves_a_cycle_between_two_archives() {
+        let [root, a, b] = cycle_inputs();
+        let inputs = [("root.o", root.as_slice()), ("liba.a", &a), ("libb.a", &b)];
+        assert_eq!(
+            names(&extract_inputs(&inputs, &[])),
+            ["root.o", "liba.a(a.o)", "libb.a(b.o)"]
+        );
+        let objects = extract_inputs(&inputs, &[1..3]);
+        assert_eq!(
+            names(&objects),
+            ["root.o", "liba.a(a.o)", "libb.a(b.o)", "liba.a(a2.o)"]
+        );
+        assert_eq!(
+            objects
+                .extractions
+                .iter()
+                .map(|record| record.symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "a2"]
+        );
+        assert_eq!(
+            objects.extractions[2].referencer,
+            Some(FileId::ArchiveMember {
+                archive_index: 2,
+                member_index: 0
+            })
+        );
+    }
+
+    #[test]
+    fn an_archive_before_a_group_is_not_revisited() {
+        use Elf64SymbolBinding::STB_GLOBAL as Global;
+        let [root, _, b] = cycle_inputs();
+        let a = build_rel_object(&[symbol("a", Global, 2), symbol("b", Global, 0)], &[]);
+        let a = crate::test_utils::build_indexed_archive(&[("a.o/", &a)], &[("a", 0)]);
+        let a2 = build_rel_object(&[symbol("a2", Global, 2)], &[]);
+        let outside = crate::test_utils::build_indexed_archive(&[("a2.o/", &a2)], &[("a2", 0)]);
+        let objects = extract_inputs(
+            &[
+                ("root.o", &root),
+                ("outside.a", &outside),
+                ("liba.a", &a),
+                ("libb.a", &b),
+            ],
+            &[2..4],
+        );
+        assert_eq!(names(&objects), ["root.o", "liba.a(a.o)", "libb.a(b.o)"]);
+    }
+
+    #[test]
+    fn an_archive_after_a_group_is_searched_after_all_group_passes() {
+        use Elf64SymbolBinding::STB_GLOBAL as Global;
+        let [root, _, b] = cycle_inputs();
+        let a = build_rel_object(&[symbol("a", Global, 2), symbol("b", Global, 0)], &[]);
+        let a2 = build_rel_object(&[symbol("a2", Global, 2), symbol("tail", Global, 0)], &[]);
+        let extra = build_rel_object(&[symbol("extra", Global, 2)], &[]);
+        let a = crate::test_utils::build_indexed_archive(
+            &[("a.o/", &a), ("a2.o/", &a2), ("extra.o/", &extra)],
+            &[("a", 0), ("a2", 1), ("extra", 2)],
+        );
+        let tail = build_rel_object(
+            &[symbol("tail", Global, 2), symbol("extra", Global, 0)],
+            &[],
+        );
+        let outside =
+            crate::test_utils::build_indexed_archive(&[("tail.o/", &tail)], &[("tail", 0)]);
+        let objects = extract_inputs(
+            &[
+                ("root.o", &root),
+                ("liba.a", &a),
+                ("libb.a", &b),
+                ("outside.a", &outside),
+            ],
+            &[1..3],
+        );
+        assert_eq!(
+            names(&objects),
+            [
+                "root.o",
+                "liba.a(a.o)",
+                "libb.a(b.o)",
+                "liba.a(a2.o)",
+                "outside.a(tail.o)"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_object_inside_a_group_enters_once_at_its_position() {
+        use Elf64SymbolBinding::STB_GLOBAL as Global;
+        let [_, a, b] = cycle_inputs();
+        let root = build_rel_object(&[symbol("_start", Global, 2)], &[]);
+        let middle = build_rel_object(&[symbol("a", Global, 0)], &[]);
+        let objects = extract_inputs(
+            &[
+                ("root.o", &root),
+                ("liba.a", &a),
+                ("middle.o", &middle),
+                ("libb.a", &b),
+            ],
+            &[1..4],
+        );
+        assert_eq!(
+            names(&objects),
+            [
+                "root.o",
+                "middle.o",
+                "liba.a(a.o)",
+                "libb.a(b.o)",
+                "liba.a(a2.o)"
+            ]
+        );
     }
 
     #[test]

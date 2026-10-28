@@ -13,7 +13,7 @@
 //! 2. Read the script with [`script::parse_script`] (chapter 4: script rules).
 //! 3. Map input files with [`input::load`] (chapter 2: input files).
 //! 4. Pull needed archive members with [`symbols::extract_archive_members`]
-//!    (chapter 3: archive search).
+//!    and repeat searches within groups (chapter 3: archive search).
 //! 5. Match input sections to script rules with [`script::map_sections`]
 //!    (chapter 4: section rules).
 //! 6. Pick symbol definitions with [`symbols::resolve`]
@@ -65,6 +65,10 @@ fn main() -> anyhow::Result<()> {
         ptr::write((&raw mut DEBUG_LEVEL) as *mut u8, args.debug);
     }
 
+    // cli::parse runs before DEBUG_LEVEL is set, so its warning waits until here.
+    if args.missing_end_group {
+        pr_warn!("missing --end-group; added as last command line option");
+    }
     pr_debug!("Arguments: {:?}", args);
 
     let mut report = report::Reporter::new(args.report);
@@ -75,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     let mut storage = input::MappedFiles::default();
     let files = input::load(&args.input, &mut storage)?;
     report.inputs(&files)?;
-    let objects = symbols::extract_archive_members(files, script.entry_name())?;
+    let objects = symbols::extract_archive_members(files, script.entry_name(), &args.groups)?;
     report.archive(&objects)?;
     // Mapping consumes the objects, but errors still need their file names.
     let names = input::FileNames::new(&objects.files);
