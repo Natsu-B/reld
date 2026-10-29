@@ -1,3 +1,8 @@
+/* Adapted from the GNU ld default linker script for elf_x86_64 (static link).
+   Copyright (C) 2014-2026 Free Software Foundation, Inc.
+   Copying and distribution of this script, with or without modification,
+   are permitted in any medium without royalty provided the copyright
+   notice and this notice are preserved.  */
 ENTRY(_start)
 SECTIONS
 {
